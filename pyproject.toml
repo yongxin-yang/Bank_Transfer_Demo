@@ -1,0 +1,40 @@
+[project]
+name = "transferpayments"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20.1",
+    "asyncmy>=0.2.17",
+    "cryptography>=50.0.2",
+    "fastapi[standard]>=0.159.1",
+    "pydantic-settings>=2.16.1",
+    "python-dotenv>=1.2.4",
+    "snowflake-id>=1.0.2",
+    "sqlalchemy[asyncio]>=2.1.6",
+    "structlog>=26.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.1",
+]
+
+[tool.pytest.ini_options]
+# 全部异步测试：async def 测试函数无需再手动加 @pytest.mark.asyncio
+asyncio_mode = "auto"
+# 测试与 fixture 统一跑在同一个 session 级事件循环上，
+# 否则 asyncmy 连接池里的连接会绑定到各自测试的循环，跨用例复用时直接报错
+testpaths = ["tests"]
+# 让 pytest 把项目根目录加入 sys.path，才能 import app 包
+pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI 依赖注入惯用写法：Depends 作为参数默认值是官方推荐模式
+"app/routes/*.py" = ["B008"]

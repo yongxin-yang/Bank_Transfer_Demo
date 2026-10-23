@@ -1,0 +1,261 @@
+# 银行转账模拟后端 Demo
+
+> ⚠️ **本项目是教学 Demo，仅用于学习资金转账一致性问题，严禁用于任何真实资金场景。**
+
+用最小可运行的代码复现面试高频场景：转账成功、数据库报错回滚、锁等待堵塞、重复提交、
+commit 后网络中断、死锁风险；并演示幂等防护、并发限流与覆盖极端场景的 pytest 用例。
+
+## 技术栈
+
+- FastAPI + Uvicorn
+- SQLAlchemy 2.0（全异步）+ asyncmy
+- MySQL（InnoDB，DECIMAL 金额）
+- Alembic（异步迁移模板）
+- Pydantic v2 / pydantic-settings
+- snowflake-id（雪花算法单号）
+- pytest + pytest-asyncio + httpx（ASGITransport 进程内联调）
+
+## 目录结构
+
+```
+app/
+├── main.py            # FastAPI 应用入口（全局异常处理、路由注册）
+├── settings.py        # pydantic-settings 读取 .env
+├── database.py        # 异步引擎 / Session / 会话级锁超时设置
+├── exceptions.py      # 业务异常 + 统一 JSON 错误格式
+├── models/            # ORM 模型：account、transfer_record
+├── schemas/           # Pydantic 入参/出参
+├── routes/            # account、transfer 接口
+├── services/          # 转账核心事务逻辑、Semaphore 限流
+└── utils/snowflake.py # 雪花单号
+alembic/               # 迁移脚本
+tests/                 # 12 类极端场景用例
+main.py                # 开发启动入口
+```
+
+## 快速开始
+
+### 1. 准备 MySQL
+
+```sql
+CREATE DATABASE IF NOT EXISTS transfer_demo DEFAULT CHARACTER SET utf8mb4;
+```
+
+> MySQL 8+ 默认 `caching_sha2_password` 认证，asyncmy 需要 `cryptography` 依赖，
+> 本项目已在 `pyproject.toml` 中声明，无需额外安装。
+
+### 2. 安装依赖
+
+```bash
+uv sync
+```
+
+如需手动补充依赖（示例）：
+
+```bash
+uv add fastapi[standard] "sqlalchemy[asyncio]" asyncmy alembic pydantic-settings snowflake-id cryptography
+uv add --dev pytest pytest-asyncio httpx ruff
+```
+
+### 3. 配置环境变量
+
+复制 `.env.example` 为 `.env` 并填写数据库连接：
+
+| 变量 | 说明 |
+| --- | --- |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | MySQL 连接 |
+| `TRANSFER_SEMAPHORE_LIMIT` | `/api/transfer/submit` 并发限流阈值（进程内 Semaphore） |
+| `DB_LOCK_WAIT_TIMEOUT` | InnoDB 锁等待超时（秒），会话级，每条连接建立时设置 |
+| `ENABLE_FAULT_INJECT` | 故障注入总开关，默认 `false` |
+
+### 4. 初始化 / 迁移数据库
+
+```bash
+# 首次初始化 alembic（本仓库已初始化，无需重复执行）
+uv run alembic init -t async alembic
+
+# 应用全部迁移（建表、索引、CHECK 约束）
+uv run alembic upgrade head
+
+# 修改 ORM 模型后重新生成迁移脚本
+uv run alembic revision --autogenerate -m "describe your change"
+uv run alembic upgrade head
+```
+
+### 5. 启动服务
+
+```bash
+uv run uvicorn app.main:app --reload
+# 或
+uv run python main.py
+```
+
+接口文档：<http://127.0.0.1:8000/docs>
+
+## 接口清单
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/account/create` | 新建测试账户（构造数据用） |
+| GET | `/api/account/{account_no}` | 查询账户余额 |
+| POST | `/api/transfer/apply-no` | 申请转账单号（后端雪花算法颁发，流水置 INIT） |
+| POST | `/api/transfer/submit` | 提交转账（核心接口，支持 `?fault_stage=` 故障注入） |
+| GET | `/api/transfer/{trade_no}` | 查询转账结果（前端轮询最终状态） |
+
+金额字段一律使用 Decimal，JSON 中以**字符串**输出，避免浮点精度丢失。
+错误统一返回 `{"code": "...", "message": "..."}`，不泄露原生异常。
+
+## curl 全流程演示
+
+### 1）创建两个账户
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/account/create \
+  -H "Content-Type: application/json" \
+  -d '{"account_no": "ACC_A", "init_balance": "100.00"}'
+
+curl -X POST http://127.0.0.1:8000/api/account/create \
+  -H "Content-Type: application/json" \
+  -d '{"account_no": "ACC_B", "init_balance": "0.00"}'
+```
+
+### 2）申请转账单号（后端颁发，前端不得自定义）
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/transfer/apply-no
+# {"trade_no": "7518900730032463873"}
+```
+
+### 3）提交转账
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/transfer/submit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "trade_no": "7518900730032463873",
+    "from_account_no": "ACC_A",
+    "to_account_no": "ACC_B",
+    "amount": "30.00"
+  }'
+# {"trade_no":"7518900730032463873","status":"SUCCESS", ...}
+```
+
+### 4）查询结果（前端轮询用）
+
+```bash
+curl http://127.0.0.1:8000/api/transfer/7518900730032463873
+```
+
+### 5）验证幂等：同一个 trade_no 再提交一次
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/transfer/submit \
+  -H "Content-Type: application/json" \
+  -d '{"trade_no": "7518900730032463873", "from_account_no": "ACC_A", "to_account_no": "ACC_B", "amount": "30.00"}'
+# 返回历史 SUCCESS 结果，余额只变化一次
+```
+
+### 6）错误示例
+
+```bash
+# 伪造单号 -> 400 TRADE_NO_NOT_FOUND
+curl -X POST http://127.0.0.1:8000/api/transfer/submit \
+  -H "Content-Type: application/json" \
+  -d '{"trade_no": "123456789012345678", "from_account_no": "ACC_A", "to_account_no": "ACC_B", "amount": "1.00"}'
+
+# 余额不足 -> 409 INSUFFICIENT_BALANCE，流水 FAILED
+```
+
+### 7）故障注入（先在 .env 打开 `ENABLE_FAULT_INJECT=true` 并重启服务）
+
+```bash
+# 事务中途异常（扣钱后、加钱前）-> 完整回滚，流水 FAILED
+curl -X POST "http://127.0.0.1:8000/api/transfer/submit?fault_stage=mid_tx" \
+  -H "Content-Type: application/json" \
+  -d '{"trade_no": "<新申请的单号>", "from_account_no": "ACC_A", "to_account_no": "ACC_B", "amount": "30.00"}'
+
+# commit 成功、响应前“断网”-> 客户端收到 500，但查询接口能看到 SUCCESS
+curl -X POST "http://127.0.0.1:8000/api/transfer/submit?fault_stage=after_commit" \
+  -H "Content-Type: application/json" \
+  -d '{"trade_no": "<新申请的单号>", "from_account_no": "ACC_A", "to_account_no": "ACC_B", "amount": "30.00"}'
+```
+
+## 测试
+
+```bash
+uv run pytest -v
+```
+
+> ⚠️ 测试使用 `.env` 指向的数据库，每个用例前会 `TRUNCATE` 两张业务表，
+> 请务必指向专用测试库，不要指向含真实数据的库。
+
+| # | 用例 | 文件::函数 | 预期现象 |
+| --- | --- | --- | --- |
+| 1 | 正常转账全流程 | `test_transfer_basic.py::test_normal_transfer_flow` | INIT -> 提交 -> SUCCESS，A 扣 30 / B 加 30 |
+| 2 | 非法参数（同账户/0/负数/3 位小数） | `::test_invalid_params_rejected_before_transaction` | 422 直接拦截，余额与流水（仍 INIT）不变 |
+| 3 | 余额不足 | `::test_insufficient_balance_marks_failed` | 事务回滚，余额不变，流水 FAILED |
+| 4 | 幂等重复提交（串行 + 并发） | `::test_idempotent_repeat_and_concurrent_submit` | 资金只变更一次，并发同单号也仅执行一次 |
+| 5 | 热点账户高并发 | `test_transfer_concurrency.py::test_hot_account_concurrent_debit` | 20 并发不超扣，最终余额数学一致 |
+| 6 | 双向并发转账 | `::test_bidirectional_transfer_no_deadlock` | A<->B 并发无死锁，总额守恒 |
+| 7 | 锁等待超时 | `::test_lock_wait_timeout_marks_failed` | 等待约 5s 后 503 LOCK_WAIT_TIMEOUT，流水 FAILED |
+| 8 | 事务中途故障注入 | `test_transfer_fault.py::test_fault_inject_mid_tx_rolls_back` | 完整回滚，余额不变，流水 FAILED |
+| 9 | commit 后网络中断中间态 | `::test_after_commit_network_fault_then_poll_and_retry` | 查询到 SUCCESS，重试不重复扣款 |
+| 10 | 超过限流阈值 | `test_transfer_concurrency.py::test_semaphore_rejects_when_saturated` | 4 个请求直接 503 SERVICE_BUSY，仅 1 笔成交 |
+| 11 | 边界金额精度 | `test_transfer_basic.py::test_boundary_amounts_decimal_precision` | 0.01 与大额均精确到分，无浮点误差 |
+| 12 | 伪造 trade_no | `::test_fake_trade_no_rejected` | 400 TRADE_NO_NOT_FOUND；缺字段 422 |
+
+另有账户建/查/重复建的 3 个基础用例（`test_account.py`），全套 16 个用例当前全部通过。
+
+## 核心设计说明
+
+### 为什么拆成“申请单号 + 提交”两步
+
+金融标准方案：单号必须由后端颁发（雪花算法，全局唯一、趋势递增）。
+前端自定义单号可被伪造或复用，幂等体系会失效。`apply-no` 先落一条 INIT 流水，
+`submit` 只认已存在的单号。
+
+### 幂等三层防线
+
+1. **预颁发单号**：只有后端颁发的 `trade_no` 才能提交；
+2. **唯一索引兜底**：`transfer_record.trade_no` 唯一索引，重复插入直接被数据库拒绝；
+3. **行锁 + 二次状态校验**：由于流水在 `apply-no` 阶段已存在，唯一索引无法阻止
+   “同一个已存在的单号被并发执行两次”。因此 `submit` 在事务内对流水行加
+   `SELECT ... FOR UPDATE`，后到请求阻塞到先到者提交后重新读取状态（`populate_existing`
+   强制刷新 ORM 缓存），看到 SUCCESS/FAILED 直接返回历史结果。
+
+### 行锁与防止表锁
+
+扣款采用 `SELECT ... FOR UPDATE` 锁账户行。`account_no` 建有唯一索引，
+等值条件命中索引时 InnoDB 只加行锁；若 `for update` 落在无索引列上，
+会退化为锁全表，并发性能瞬间崩塌。
+
+### 固定锁顺序消除死锁
+
+两个账户永远按 `account_no` 字典序先锁小的、再锁大的。A->B 与 B->A 并发时
+加锁方向一致，不存在循环等待，从根源消除死锁。
+
+### 事务原子性与失败记录
+
+余额变更与流水状态在同一事务（`async with session.begin()`）：
+要么一起成功，要么一起回滚。异常回滚后，用**新事务**把流水标记为 FAILED
+并写入 `error_msg` —— 原事务已整体回滚，失败状态必须单独提交。
+
+### 限流与故障注入
+
+- 限流：`asyncio.Semaphore` 非阻塞抢占，超过阈值直接 503，请求不堆积到数据库；
+  仅单进程生效，生产使用 Redis 令牌桶 / 网关限流；
+- 故障注入：`ENABLE_FAULT_INJECT=true` 为总开关，`?fault_stage=mid_tx|after_commit`
+  选择阶段。`after_commit` 用 JSON 500 模拟“响应丢失”，等价于前端超时但后端已提交。
+
+## 已知取舍
+
+- **FAILED 是终态**：确定失败后必须重新申请单号再转账；
+  “重试携带同一个 trade_no”只适用于结果不确定的场景（如 commit 后超时）。
+- `after_commit` 故障注入返回 JSON 500 而非直接断开 TCP，教学近似即可。
+- 测试直接复用 `.env` 指向的库并清表，请使用专用测试库。
+- 限流为进程内实现，多副本部署时无全局约束。
+
+## 生产环境还需补充（本 Demo 不实现）
+
+分布式锁、MQ 削峰、SAGA/TCC 分布式事务、定时对账任务、异常人工调账表、
+分布式链路追踪、多库分片与容灾、审计与风控。
