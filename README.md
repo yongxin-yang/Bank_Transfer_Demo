@@ -7,10 +7,10 @@ workflow: "先让AI写基于mysql,fastapi,sqlalchemy框架的该问题的Demo,�
 
 2. 事务具有ACID的特性
 原子性在该代码中表现为需要收到保护的银行汇款事务的操作包括：
-查找汇款表并锁住、按照account号对汇款方和汇入方Account表进行从小到大排列依次读取并锁住、对两个表依次进行balance操作、操作完成之后依次释放所有锁，由事务管理器进行commit
+查找汇款表并锁住、按照account号对汇款方和汇入方Account表进行从小到大排列依次读取并锁住、对两个表依次进行balance操作、操作完成之后统一释放所有锁，由事务管理器进行commit
 如果有一个出错则通过async with session.begin()的事务管理进行全部回滚。
 
-3. 调度捕获的是影响事务并发执行的关键操作，在代码中以async,await等关键字来实现。
+3. 调度捕获的是影响事务并发执行的关键操作，在代码中以async,await等关键字来实现，包括应用层和数据库层。
 不同于进程之间的切换可以强制断点，调度只能在await中进行转换。
 
 4. 为保证幂等，每一笔转账具有唯一的trade_no,一行TransferRecord
